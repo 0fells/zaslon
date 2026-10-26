@@ -253,7 +253,11 @@ take_lock() {
   (( DRY_RUN )) && return 0
   have flock || return 0
   exec 9>"$ZS_LOCK"
-  flock -n 9 || die busy "$ZS_NAME"
+  flock -w 300 9 || die busy "$ZS_NAME"
+}
+
+release_lock() {
+  { exec 9>&-; } 2>/dev/null || true
 }
 
 cleanup() { [[ -n $WORK && -d $WORK ]] && rm -rf "$WORK"; return 0; }
@@ -597,6 +601,8 @@ nft_test() {
 nft_stats() {
   local c line pk
   for c in rkn4 rkn6 badflags ping; do
+    [[ $c == badflags ]] && (( ! BAD_TCP_FLAGS )) && continue
+    [[ $c == ping ]] && (( ! DROP_PING )) && continue
     line=$(nft list counter inet "$ZS_TABLE" "$c" 2>/dev/null | grep -oE 'packets [0-9]+' || true)
     [[ -n $line ]] || continue
     pk=${line#packets }
@@ -833,9 +839,15 @@ cmd_check() {
       ipt_test "$ip" "${ZS_SET}w6" "${ZS_SET}w4" && wl=0
       ipt_test "$ip" "${ZS_SET}6" "${ZS_SET}4" && hit=0 ;;
   esac
-  local found=""
+  local found="" active=1
+  case "$BACKEND" in
+    nft) nft_active && active=0 ;;
+    iptables) ipt_active && active=0 ;;
+  esac
   [[ $ip == *:* ]] || found=$(v4_sources "$ip")
-  [[ -n $found ]] && hit=0
+  if [[ -n $found ]] && (( active != 0 )); then
+    hit=0
+  fi
   if (( wl == 0 )); then
     say ck_wl "$ip"
   elif (( hit == 0 )); then
@@ -843,7 +855,9 @@ cmd_check() {
   else
     say ck_out "$ip"
   fi
-  [[ -z $found ]] || printf '%s\n' "$found"
+  if [[ -n $found ]] && (( wl != 0 && hit == 0 )); then
+    printf '%s\n' "$found"
+  fi
 }
 
 list_edit() {
@@ -1029,7 +1043,7 @@ Persistent=true
 WantedBy=timers.target
 EOF
     systemctl daemon-reload
-    systemctl enable "${ZS_NAME}.service" >/dev/null 2>&1
+    systemctl enable --now "${ZS_NAME}.service" >/dev/null 2>&1
     systemctl enable --now "${ZS_NAME}-update.timer" >/dev/null 2>&1
     info installed "$UPDATE_CALENDAR"
   else
@@ -1065,6 +1079,7 @@ cmd_install() {
   pick_backend
   mkdir -p "$ZS_STATE/cache"
   do_update
+  release_lock
   install_units
 }
 

@@ -356,7 +356,11 @@ take_lock() {
   (( DRY_RUN )) && return 0
   have flock || return 0
   exec 9>"$ZS_LOCK"
-  flock -n 9 || die busy "$ZS_NAME"
+  flock -w 300 9 || die busy "$ZS_NAME"
+}
+
+release_lock() {
+  { exec 9>&-; } 2>/dev/null || true
 }
 
 cleanup() { [[ -n $WORK && -d $WORK ]] && rm -rf "$WORK"; return 0; }
@@ -829,6 +833,9 @@ nft_untrap() {
 nft_stats() {
   local c line pk
   for c in threat trap flood dc badflags; do
+    [[ $c == trap ]] && (( ! TRAP )) && continue
+    [[ $c == flood ]] && (( FLOOD_RATE == 0 )) && continue
+    [[ $c == badflags ]] && (( ! BAD_TCP_FLAGS )) && continue
     line=$(nft list counter inet "$ZS_TABLE" "$c" 2>/dev/null | grep -oE 'packets [0-9]+' || true)
     [[ -n $line ]] || continue
     pk=${line#packets }
@@ -1177,9 +1184,13 @@ cmd_check() {
       ipt_test "$ip" d && dc=0
       ipt_test "$ip" t && tr=0 ;;
   esac
-  local found="" g
+  local found="" g active=1
+  case "$BACKEND" in
+    nft) nft_active && active=0 ;;
+    iptables) ipt_active && active=0 ;;
+  esac
   [[ $ip == *:* ]] || found=$(v4_sources "$ip")
-  if [[ -n $found ]] && (( hit && dc )); then
+  if [[ -n $found ]] && (( active != 0 && hit && dc )); then
     hit=0
     for g in "${DC_BLOCK[@]+"${DC_BLOCK[@]}"}" DC_EXTRA_ASNS; do
       if grep -q " $g (" <<<"$found"; then
@@ -1194,9 +1205,11 @@ cmd_check() {
     (( hit == 0 )) && say ck_in "$ip"
     (( dc == 0 )) && say ck_dc "$ip"
     (( tr == 0 )) && say ck_trap "$ip"
-    (( hit && dc && tr )) && [[ -z $found ]] && say ck_out "$ip"
+    (( hit && dc && tr )) && say ck_out "$ip"
   fi
-  [[ -z $found ]] || printf '%s\n' "$found"
+  if [[ -n $found ]] && (( wl != 0 && (hit == 0 || dc == 0) )); then
+    printf '%s\n' "$found"
+  fi
 }
 
 cmd_trapped() {
@@ -1449,7 +1462,7 @@ Persistent=true
 WantedBy=timers.target
 EOF
     systemctl daemon-reload
-    systemctl enable "${ZS_NAME}.service" >/dev/null 2>&1
+    systemctl enable --now "${ZS_NAME}.service" >/dev/null 2>&1
     systemctl enable --now "${ZS_NAME}-update.timer" >/dev/null 2>&1
     info installed "$UPDATE_CALENDAR"
   else
@@ -1485,6 +1498,7 @@ cmd_install() {
   pick_backend
   mkdir -p "$ZS_STATE/cache"
   do_update
+  release_lock
   install_units
 }
 
